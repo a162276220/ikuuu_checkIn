@@ -2,7 +2,7 @@ import requests, json, re, os, time
 
 session = requests.session()
 
-# url = 'https://ikuuu.me'
+# url = 'https://ikuuu.de'
 url = os.environ.get('URL')
 login_url = '{}/auth/login'.format(url)
 check_url = '{}/user/checkin'.format(url)
