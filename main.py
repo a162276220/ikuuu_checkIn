@@ -11,12 +11,16 @@ COOKIE 模式（推荐）
 
 账号模式（legacy）
     环境变量 URL、INFO（`邮箱<split>密码<split>pushplus_token`，多账号用 , 分隔）。
-    面板升级后 /auth/login 要求 phase=password 并且必须携带极验 Geetest V4 的
-    captcha_result，纯 requests 会被判 captcha_failed，因此该模式仅在面板关闭
-    人机验证时可用。
+    面板登录要求 phase=password 并且必须携带极验 Geetest V4 的 captcha_result，
+    纯 requests 会被判 captcha_failed，因此该模式仅在面板关闭人机验证时可用。
 
-推送：pushplus，走 POST JSON，不再把 token 和签到内容拼进 query string。
-失败即非零退出，让 Actions 直接变红，而不是"绿色但没签到"。
+判定口径
+    面板的返回不是所有情况都 ret=1：今天已经签到时返回的是类似
+    {"msg": "您似乎已经签到过了..."} 的提示，这属于成功而非失败。
+    因此统一走 classify()：already / success / failure 三态。
+
+推送：pushplus，走 POST JSON，token 不再拼进 query string。
+失败即非零退出，并通过 ::error:: 注解把原因顶到 Actions 摘要页。
 """
 
 import json
@@ -35,9 +39,20 @@ UA = (
 PUSHPLUS_API = "https://www.pushplus.plus/send"
 DEFAULT_BASE = "https://ikuuu.top"
 
+# 今天已经签到过 —— 幂等成功，不是失败
+ALREADY_HINTS = ("已经签到", "已签到", "签到过了", "已打卡", "already")
+# 正常签到成功
+SUCCESS_HINTS = ("签到成功", "获得", "流量", "success")
+
 
 def log(msg):
     print(msg, flush=True)
+
+
+def annotate(level, msg):
+    """把信息顶到 GitHub Actions 的 Annotations 面板，不用展开日志。"""
+    one_line = " ".join(str(msg).split())
+    print("::%s::%s" % (level, one_line[:900]), flush=True)
 
 
 def build_session(base, cookie=None):
@@ -64,6 +79,16 @@ def read_json(resp, what):
             "%s 返回的不是 JSON（HTTP %s）：%r"
             % (what, resp.status_code, resp.text[:200].replace("\n", " "))
         ) from None
+
+
+def classify(data, msg):
+    """把面板响应归类为 already / success / failure。"""
+    if any(hint in msg for hint in ALREADY_HINTS):
+        return "already"
+    code = data.get("ret", data.get("code"))
+    if code in (1, 200) or any(hint in msg for hint in SUCCESS_HINTS):
+        return "success"
+    return "failure"
 
 
 def probe_base(base):
@@ -98,17 +123,25 @@ def push(token, content):
         log("推送失败（不影响签到判定）：%r" % exc)
 
 
+def report(data, token):
+    """统一处理签到响应：打日志、推送、返回状态。"""
+    msg = data.get("msg") or json.dumps(data, ensure_ascii=False)[:200]
+    log("签到原始响应：%s" % json.dumps(data, ensure_ascii=False)[:300])
+    state = classify(data, msg)
+    label = {"already": "今天已签到", "success": "签到成功", "failure": "签到失败"}[state]
+    log("签到结果（%s）：%s" % (label, msg))
+    push(token, "%s：%s" % (label, msg))
+    if state == "failure":
+        raise RuntimeError("%s：%s" % (label, msg))
+    return state
+
+
 def checkin_with_cookie(base, cookie, token):
     session = build_session(base, cookie)
     resp = session.post(base + "/user/checkin", timeout=TIMEOUT, allow_redirects=False)
     if resp.status_code in (301, 302, 303, 307):
         raise RuntimeError("签到接口 302 到登录页：Cookie 已失效，请重新登录后复制")
-    data = read_json(resp, "签到接口")
-    msg = data.get("msg") or json.dumps(data, ensure_ascii=False)[:200]
-    log("签到结果：%s" % msg)
-    push(token, msg)
-    if data.get("ret") != 1:
-        raise RuntimeError("签到未成功：%s" % msg)
+    return report(read_json(resp, "签到接口"), token)
 
 
 def login_and_checkin(base, email, password, token):
@@ -132,15 +165,13 @@ def login_and_checkin(base, email, password, token):
         raise RuntimeError("登录失败：%s" % (data.get("msg") or data))
     log("登录成功：%s" % data.get("msg", ""))
 
-    data = read_json(
-        session.post(base + "/user/checkin", timeout=TIMEOUT, allow_redirects=False),
-        "签到接口",
+    return report(
+        read_json(
+            session.post(base + "/user/checkin", timeout=TIMEOUT, allow_redirects=False),
+            "签到接口",
+        ),
+        token,
     )
-    msg = data.get("msg") or json.dumps(data, ensure_ascii=False)[:200]
-    log("签到结果：%s" % msg)
-    push(token, msg)
-    if data.get("ret") != 1:
-        raise RuntimeError("签到未成功：%s" % msg)
 
 
 def parse_info(raw):
@@ -165,38 +196,49 @@ def main():
     probe_base(base)
 
     failures = []
+    results = []
     if cookie_raw:
         cookies = [c.strip() for c in cookie_raw.split("||") if c.strip()]
         log("模式：COOKIE，共 %d 个会话" % len(cookies))
         for idx, cookie in enumerate(cookies):
             token = accounts[idx]["token"] if idx < len(accounts) else ""
             try:
-                checkin_with_cookie(base, cookie, token)
+                results.append(checkin_with_cookie(base, cookie, token))
             except Exception as exc:
                 log("会话#%d 失败：%s" % (idx + 1, exc))
                 traceback.print_exc()
                 push(token, "签到失败：%s" % exc)
-                failures.append(str(exc))
+                failures.append("会话#%d %s" % (idx + 1, exc))
             time.sleep(2)
     elif accounts:
         log("模式：账号密码（legacy），共 %d 个账号" % len(accounts))
         for idx, acc in enumerate(accounts):
             try:
-                login_and_checkin(base, acc["email"], acc["password"], acc["token"])
+                results.append(
+                    login_and_checkin(base, acc["email"], acc["password"], acc["token"])
+                )
             except Exception as exc:
                 log("账号#%d 失败：%s" % (idx + 1, exc))
                 traceback.print_exc()
                 push(acc["token"], "签到失败：%s" % exc)
-                failures.append(str(exc))
+                failures.append("账号#%d %s" % (idx + 1, exc))
             time.sleep(2)
     else:
         log("错误：既没有配置 COOKIE，也没有配置 INFO")
+        annotate("error", "未配置 COOKIE / INFO，无法签到")
         return 2
 
     if failures:
         log("共 %d 项失败" % len(failures))
+        annotate("error", "签到失败：" + "；".join(failures))
         return 1
-    log("全部签到完成")
+
+    summary = "全部完成（%d 项），其中已签到 %d 项" % (
+        len(results),
+        sum(1 for r in results if r == "already"),
+    )
+    log(summary)
+    annotate("notice", summary)
     return 0
 
 
