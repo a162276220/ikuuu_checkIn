@@ -5,25 +5,33 @@ on:
     - cron: "0 22 * * *"  # scheduled at 06:00 (UTC+8) everyday
   workflow_dispatch:
 
+# 签到任务只需读仓库，不需要写权限
+permissions:
+  contents: read
+
 env:
   RUN_ENV: 'prod'
 
+# 定时任务串行执行，避免前一轮未结束时重复签到
+concurrency:
+  group: airport-checkin
+  cancel-in-progress: false
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-    # if: github.ref == 'refs/heads/master'
+    # 固定小版本：ubuntu-latest 自 2026-10-19 起迁移到 Ubuntu 26，
+    # 签到类 workflow 不跟随浮动标签，验证过新镜像后再放宽。
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout master
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-          # ref: master
+      - name: Checkout
+        uses: actions/checkout@v5
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v6
         with:
-          python-version: 3.12
+          python-version: "3.12"
 
       - name: Random sleep
         if: github.event_name == 'schedule'
@@ -33,6 +41,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Run sign
         env:
           URL: ${{ secrets.URL }}
