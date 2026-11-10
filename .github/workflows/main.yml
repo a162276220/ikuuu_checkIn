@@ -46,5 +46,7 @@ jobs:
         env:
           URL: ${{ secrets.URL }}
           INFO: ${{ secrets.INFO }}
+          # 推荐：浏览器登录后复制的 Cookie，设置后优先于账号密码登录
+          COOKIE: ${{ secrets.COOKIE }}
         run: |
           python3 ./main.py
